@@ -1,0 +1,280 @@
+name: Build BakaSU + Droidspaces kernel (Ace 3V / audi)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repository:
+        description: "Kernel repository (owner/repo)"
+        type: string
+        default: "Alhugh233/android_kernel_oneplus_sm8650"
+      kernel_ref:
+        description: "Kernel branch/tag/commit"
+        type: string
+        default: "lineage-23.2"
+      kernel_modules_repository:
+        description: "Kernel modules repository (owner/repo)"
+        type: string
+        default: "LineageOS/android_kernel_oneplus_sm8650-modules"
+      kernel_modules_ref:
+        description: "Kernel modules branch/tag/commit"
+        type: string
+        default: "lineage-23.2"
+      bakasu_ref:
+        description: "Optional BakaSU ref override (empty = pinned submodule)"
+        type: string
+        default: ""
+      clang_version:
+        description: "AOSP clang version"
+        type: string
+        default: "r563880c"
+      clang_branch:
+        description: "AOSP prebuilt clang branch"
+        type: string
+        default: "android16-qpr2-release"
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      KERNEL_REPOSITORY: ${{ inputs.kernel_repository || 'Alhugh233/android_kernel_oneplus_sm8650' }}
+      KERNEL_REF: ${{ inputs.kernel_ref || 'lineage-23.2' }}
+      KERNEL_MODULES_REPOSITORY: ${{ inputs.kernel_modules_repository || 'LineageOS/android_kernel_oneplus_sm8650-modules' }}
+      KERNEL_MODULES_REF: ${{ inputs.kernel_modules_ref || 'lineage-23.2' }}
+      BAKASU_REF: ${{ inputs.bakasu_ref || '' }}
+      CLANG_VERSION: ${{ inputs.clang_version || 'r563880c' }}
+      CLANG_BRANCH: ${{ inputs.clang_branch || 'android16-qpr2-release' }}
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        shell: bash
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h
+
+      - name: Create swap
+        shell: bash
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 4G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libelf-dev libssl-dev libncurses-dev \
+            rsync cpio zip unzip zstd lz4 python3 perl swig \
+            libdw-dev dwarves device-tree-compiler \
+            binutils-aarch64-linux-gnu build-essential
+          pahole --version
+
+      - name: Checkout kernel
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KERNEL_REPOSITORY }}
+          ref: ${{ env.KERNEL_REF }}
+          path: kernel
+          submodules: recursive
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout kernel modules
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KERNEL_MODULES_REPOSITORY }}
+          ref: ${{ env.KERNEL_MODULES_REF }}
+          path: sm8650-modules
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare BakaSU submodule
+        shell: bash
+        run: |
+          git -C kernel/KernelSU fetch --unshallow --tags || true
+          if [ -n "$BAKASU_REF" ]; then
+            git -C kernel/KernelSU fetch --depth=1 origin "$BAKASU_REF"
+            git -C kernel/KernelSU checkout --detach FETCH_HEAD
+          fi
+          git -C kernel/KernelSU log -1 --oneline
+
+      - name: Remove GKI protected exports list
+        shell: bash
+        working-directory: kernel
+        run: |
+          # Stock vendor modules (notably Qualcomm WiFi) may export protected
+          # GKI symbols such as qca_*.  With CONFIG_MODULE_SIG_PROTECT=y the
+          # kernel then refuses to load them.  Removing the list disables only
+          # that protected-export rejection; MODVERSIONS/CRC checks remain.
+          rm -f android/abi_gki_protected_exports_aarch64
+          rm -f android/abi_gki_protected_exports_x86_64
+          if [ -f BUILD.bazel ]; then
+            sed -i '/"protected_exports_list"/d' BUILD.bazel
+          fi
+          test ! -e android/abi_gki_protected_exports_aarch64
+
+      - name: Commit build-time changes
+        shell: bash
+        working-directory: kernel
+        run: |
+          # Keep the tree clean so scripts/setlocalversion does not append
+          # "-dirty" to the kernel release.
+          git add -A
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "build: remove GKI protected exports for WiFi compatibility" || true
+          git status --short
+
+      - name: Restore clang
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/clang
+          key: clang-${{ env.CLANG_VERSION }}-${{ env.CLANG_BRANCH }}-v1
+
+      - name: Download clang
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          # Download only the requested clang version. Cloning the prebuilt
+          # repository (even with --no-checkout) fetches every clang version
+          # and can take a very long time.
+          if curl -L --fail --retry 5 --retry-delay 5 -C - \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${CLANG_BRANCH}/clang-${CLANG_VERSION}.tar.gz" \
+            -o "$HOME/clang.tar.gz"; then
+            mkdir -p "$HOME/clang"
+            tar -xzf "$HOME/clang.tar.gz" -C "$HOME/clang"
+            rm -f "$HOME/clang.tar.gz"
+          else
+            echo "Archive download failed, falling back to a partial git clone"
+            rm -rf "$HOME/clang-repo" "$HOME/clang"
+            git clone --depth=1 --filter=blob:none --sparse --single-branch \
+              -b "$CLANG_BRANCH" \
+              https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+              "$HOME/clang-repo"
+            cd "$HOME/clang-repo"
+            git sparse-checkout set "clang-${CLANG_VERSION}"
+            cd "$HOME"
+            mv "clang-repo/clang-${CLANG_VERSION}" "$HOME/clang"
+            rm -rf "$HOME/clang-repo"
+          fi
+          if [ ! -x "$HOME/clang/bin/clang" ] && \
+             [ -x "$HOME/clang/clang-${CLANG_VERSION}/bin/clang" ]; then
+            mv "$HOME/clang/clang-${CLANG_VERSION}" "$HOME/clang-dir"
+            rm -rf "$HOME/clang"
+            mv "$HOME/clang-dir" "$HOME/clang"
+          fi
+          test -x "$HOME/clang/bin/clang"
+
+      - name: Verify toolchain
+        shell: bash
+        run: |
+          export PATH="$HOME/clang/bin:$PATH"
+          clang --version
+          ld.lld --version
+
+      - name: Build kernel
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/clang/bin:$PATH"
+
+          MAKE_ARGS=(
+            O=out
+            ARCH=arm64
+            LLVM=1
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            HOSTCC=clang
+            HOSTCXX=clang++
+            HOSTLD=ld.lld
+            CROSS_COMPILE=aarch64-linux-gnu-
+            KCFLAGS=-Wno-error
+          )
+
+          make "${MAKE_ARGS[@]}" gki_defconfig
+          KCONFIG_CONFIG=out/.config scripts/kconfig/merge_config.sh -m -O out out/.config \
+            arch/arm64/configs/vendor/pineapple_GKI.config \
+            arch/arm64/configs/vendor/oplus/pineapple_GKI.config
+          make "${MAKE_ARGS[@]}" olddefconfig
+
+          bash "$GITHUB_WORKSPACE/scripts/verify-config.sh" out/.config
+
+          make "${MAKE_ARGS[@]}" -j"$(nproc)" Image
+          make "${MAKE_ARGS[@]}" -s kernelrelease > "$GITHUB_WORKSPACE/kernel-release.txt"
+          cp out/.config "$GITHUB_WORKSPACE/kernel-config.txt"
+
+          test -s out/arch/arm64/boot/Image
+          ls -lh out/arch/arm64/boot/Image
+          cat "$GITHUB_WORKSPACE/kernel-release.txt"
+
+      - name: Package AnyKernel3
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(cat kernel-release.txt)"
+          OUT="AnyKernel3_BakaSU_Droidspaces_audi_${VERSION}.zip"
+
+          git init ak3
+          cd ak3
+          git remote add origin https://github.com/Numbersf/AnyKernel3.git
+          git fetch --depth=1 origin 47f23f7ece3ef212a392ec9ea5466e5f0b55d3c7
+          git checkout --detach FETCH_HEAD
+          rm -rf .git
+
+          cp "$GITHUB_WORKSPACE/anykernel/anykernel.sh" anykernel.sh
+          cp "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image" Image
+
+          # 只保留内核本体；不打包模块、dtb、patch
+          rm -rf modules patch ramdisk
+          rm -f README.md LICENSE
+          mkdir -p ramdisk patch
+          touch patch/placeholder
+
+          zip -r9 "../$OUT" . -x '*.git*'
+          cd ..
+          ls -lh "$OUT"
+
+      - name: Upload AnyKernel3
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnyKernel3-BakaSU-Droidspaces-audi
+          path: AnyKernel3_*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload kernel config
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-config
+          path: kernel-config.txt
+          if-no-files-found: error
+          retention-days: 14
