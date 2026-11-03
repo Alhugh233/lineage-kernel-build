@@ -5,7 +5,7 @@
 # global properties
 properties() { '
 kernel.string=BakaSU + Droidspaces kernel for OnePlus Ace 3V (audi)
-do.devicecheck=1
+do.devicecheck=0
 do.modules=0
 do.systemless=0
 do.cleanup=1
